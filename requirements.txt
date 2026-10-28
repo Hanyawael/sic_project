@@ -1,0 +1,13 @@
+streamlit
+tensorflow
+keras
+opencv-python-headless
+numpy
+pillow
+requests
+reportlab
+matplotlib
+pyngrok
+transformers
+accelerate
+torch
