@@ -1,9 +1,8 @@
 import os
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-# Run the TensorFlow/Keras segmentation model on CPU so MedGemma gets the whole GPU
+# Run the TensorFlow/Keras segmentation model on CPU (works on any server, no GPU needed)
 try:
     import tensorflow as tf
     tf.config.set_visible_devices([], "GPU")
@@ -18,13 +17,6 @@ import cv2
 import requests
 import streamlit as st
 from PIL import Image, ImageOps
-try:  # optional: only needed for the local MedGemma (GPU) mode
-    import torch
-    from transformers import pipeline
-    HAS_GPU = torch.cuda.is_available()
-except Exception:
-    torch = pipeline = None
-    HAS_GPU = False
 IMG = 256
 from huggingface_hub import hf_hub_download
 
@@ -39,9 +31,7 @@ MAX_UPLOAD_MB = 15
 MAX_PHOTOS = 5                    # photographs per batch
 MIN_SIDE_PX = 128
 FRAGMENT_LIMIT = 0.15             # max share of disc pixels allowed outside the largest connected region
-MEDGEMMA_ID = "google/medgemma-1.5-4b-it"
-MEDGEMMA_ATTEMPTS = 3             # attempts with validation feedback
-ALLOW_FALLBACK = True             # False = only MedGemma writes the report; True = Gemini/Groq may take over if it fails
+LLM_ATTEMPTS = 3                  # attempts per model, each retry gets the validator's feedback
 DISCLAIMER = ("Research and screening-support prototype. This is NOT a diagnostic tool and must not be used "
               "to make clinical decisions on its own. Every result must be reviewed by a qualified eye-care professional.")
 
@@ -329,8 +319,10 @@ def build_facts(met, thr, status, flags):
     }
 
 # =====================================================================
-# LLM CHAIN: MedGemma (primary) -> Gemini / Groq (optional backup) -> built-in template
+# LLM CHAIN: Mistral Large (primary) -> Groq gpt-oss-120b (backup) -> built-in template
+# Text-only: the models only receive the measurements computed in code (no image, no name).
 # =====================================================================
+MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 TRANSIENT = (429, 500, 502, 503, 504)
 
@@ -341,19 +333,29 @@ class LLMError(Exception):
         self.retry = retry
 
 
-def call_groq(key, model, system, user):
+def get_key(name):
+    """API key from environment variables or Streamlit secrets."""
+    val = os.environ.get(name, "")
+    if val:
+        return val
+    try:
+        return str(st.secrets.get(name, "") or "")
+    except Exception:
+        return ""
+
+
+def call_chat_api(url, key, model, system, user, extra=None):
+    """OpenAI-compatible chat completion (works for both Mistral and Groq)."""
     body = {
         "model": model,
         "messages": [{"role": "system", "content": system},
                      {"role": "user", "content": user}],
-        "temperature": 0.3,
-        "max_completion_tokens": 3500,
+        "temperature": 0.2,
         "response_format": {"type": "json_object"},
     }
-    if model.startswith("openai/gpt-oss"):
-        body["reasoning_effort"] = "low"
+    body.update(extra or {})
     try:
-        r = requests.post(GROQ_URL, json=body, timeout=60,
+        r = requests.post(url, json=body, timeout=90,
                           headers={"Authorization": f"Bearer {key}",
                                    "Content-Type": "application/json"})
     except requests.RequestException as e:
@@ -361,46 +363,30 @@ def call_groq(key, model, system, user):
     if r.status_code != 200:
         retry = r.status_code in TRANSIENT or "json_validate_failed" in r.text
         raise LLMError(f"{r.status_code}: {r.text[:200]}", retry=retry)
-    return r.json()["choices"][0]["message"].get("content") or ""
-
-
-def call_gemini(key, model, system, user):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    body = {
-        "systemInstruction": {"parts": [{"text": system}]},
-        "contents": [{"role": "user", "parts": [{"text": user}]}],
-        "generationConfig": {
-            "temperature": 0.3,
-            "maxOutputTokens": 3500,
-            "responseMimeType": "application/json",
-            "thinkingConfig": {"thinkingLevel": "low"},
-        },
-    }
-
-    def post(b):
-        return requests.post(url, json=b, timeout=60,
-                             headers={"x-goog-api-key": key,
-                                      "Content-Type": "application/json"})
     try:
-        r = post(body)
-        if r.status_code == 400 and "thinking" in r.text.lower():
-            body["generationConfig"].pop("thinkingConfig")
-            r = post(body)
-    except requests.RequestException as e:
-        raise LLMError(str(e), retry=True)
-    if r.status_code != 200:
-        raise LLMError(f"{r.status_code}: {r.text[:200]}", retry=r.status_code in TRANSIENT)
-    try:
-        parts = r.json()["candidates"][0]["content"]["parts"]
-        return "".join(p.get("text", "") for p in parts)
+        content = r.json()["choices"][0]["message"].get("content") or ""
     except Exception:
-        raise LLMError("unexpected Gemini response", retry=True)
+        raise LLMError("unexpected response format", retry=True)
+    if isinstance(content, list):                       # some APIs return a list of parts
+        content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+    return content
+
+
+def call_mistral(key, model, system, user):
+    return call_chat_api(MISTRAL_URL, key, model, system, user, {"max_tokens": 3500})
+
+
+def call_groq(key, model, system, user):
+    extra = {"max_completion_tokens": 3500}
+    if model.startswith("openai/gpt-oss"):
+        extra["reasoning_effort"] = "low"
+    return call_chat_api(GROQ_URL, key, model, system, user, extra)
 
 
 LLM_CHAIN = [
-    {"label": "Google Gemini (backup)", "fn": call_gemini,
-     "key_env": "GEMINI_API_KEY", "model": "gemini-flash-latest"},
-    {"label": "Groq - gpt-oss-120b (optional backup)", "fn": call_groq,
+    {"label": "Mistral Large (primary, validated)", "fn": call_mistral,
+     "key_env": "MISTRAL_API_KEY", "model": "mistral-large-latest"},
+    {"label": "Groq gpt-oss-120b (backup, validated)", "fn": call_groq,
      "key_env": "GROQ_API_KEY", "model": "openai/gpt-oss-120b"},
 ]
 
@@ -533,112 +519,43 @@ def fallback_report(p):
     }
 
 
-@st.cache_resource(show_spinner=False)
-def load_medgemma():
-    if not HAS_GPU:
-        raise RuntimeError("MedGemma needs a GPU. In Colab: Runtime > Change runtime type > GPU.")
-
-    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    if not token:
-        raise RuntimeError(
-            "HF_TOKEN is not set. MedGemma is a gated model: accept its license on "
-            f"https://huggingface.co/{MEDGEMMA_ID} and set os.environ['HF_TOKEN'] before starting Streamlit."
-        )
-
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    kwargs = dict(task="image-text-to-text", model=MEDGEMMA_ID, device="cuda", token=token)
-    try:
-        return pipeline(dtype=dtype, **kwargs)           # newer transformers
-    except TypeError:
-        return pipeline(torch_dtype=dtype, **kwargs)     # older transformers
-
-
-def call_medgemma(system, user, image_rgb, feedback=""):
-    pipe = load_medgemma()
-
-    im = Image.fromarray(image_rgb).convert("RGB")
-    im.thumbnail((896, 896))                              # MedGemma's native resolution
-
-    text = ("Write the screening-support report from the JSON below. The image is visual context only. "
-            "Do not change, recalculate or invent any measurement and do not override the status.\n\n"
-            "INPUT JSON:\n" + user + "\n\n")
-    if feedback:
-        text += ("A previous draft of this report was rejected for these reasons:\n" + feedback +
-                 "\nWrite a NEW, complete report that fixes all of them.\n\n")
-    text += ("Reply with ONE valid JSON object only, with exactly the keys required in the system prompt "
-             "(clinical_summary, key_findings, clinician_next_steps, patient_explanation, glossary, "
-             "patient_next_steps, limitations). Your reply must start with { and end with }. "
-             "No explanation, no apology, no text before or after it, no code fences.")
-
-    messages = [
-        {"role": "system", "content": [{"type": "text", "text": system}]},
-        {"role": "user", "content": [
-            {"type": "image", "image": im},
-            {"type": "text", "text": text},
-        ]},
-    ]
-
-    out = pipe(text=messages, max_new_tokens=3000, do_sample=False, return_full_text=False)
-    gen = out[0]["generated_text"]
-
-    if isinstance(gen, str):
-        return gen
-    if isinstance(gen, list):                              # full conversation returned
-        for m in reversed(gen):
-            if m.get("role") == "assistant":
-                c = m["content"]
-                if isinstance(c, list):
-                    return "".join(p.get("text", "") for p in c if isinstance(p, dict))
-                return c
-    return str(gen)
-
-
 def generate_report(payload, image_rgb=None):
+    """image_rgb is kept for compatibility but is not sent to any model."""
     user = json.dumps(payload, indent=2)
     errors = []
 
-    # 1. MedGemma: validated, with feedback on each retry
-    if not HAS_GPU:
-        errors.append("MedGemma skipped: no GPU available (using cloud fallback)")
-    elif image_rgb is not None:
+    for step in LLM_CHAIN:
+        key = get_key(step["key_env"])
+        if not key:
+            errors.append(f"{step['label']}: no API key set ({step['key_env']})")
+            continue
         feedback = ""
-        for attempt in range(MEDGEMMA_ATTEMPTS):
-            raw = ""
+        for attempt in range(LLM_ATTEMPTS):
+            prompt = ("Write the screening-support report from the JSON below. Do not change, recalculate "
+                      "or invent any measurement and do not override the status.\n\nINPUT JSON:\n" + user)
+            if feedback:
+                prompt += ("\n\nA previous draft was rejected for these reasons:\n" + feedback +
+                           "\nWrite a NEW, complete report that fixes all of them.")
+            prompt += ("\n\nReply with ONE valid JSON object only, with exactly the keys required in the system "
+                       "prompt. No text before or after it, no code fences.")
             try:
-                raw = call_medgemma(SYSTEM_PROMPT, user, image_rgb, feedback)
+                raw = step["fn"](key, step["model"], SYSTEM_PROMPT, prompt)
                 rep = parse_report(raw)
                 probs = validate_report(rep, payload)
                 if not probs:
-                    return rep, "Google MedGemma 1.5 4B (local, validated)", errors
-                errors.append(f"MedGemma (attempt {attempt + 1}) rejected: " + " | ".join(probs))
+                    return rep, step["label"], errors
+                errors.append(f"{step['label']} (attempt {attempt + 1}) rejected: " + " | ".join(probs))
                 feedback = "- " + "\n- ".join(probs)
+            except LLMError as e:
+                errors.append(f"{step['label']}: {e}")
+                if not e.retry:
+                    break
+                time.sleep(2 * (attempt + 1))
             except Exception as e:
-                errors.append(f"MedGemma (attempt {attempt + 1}): {str(e)[:300]} | raw output starts: {raw[:200]!r}")
-                # keep the previous feedback; the model just needs another try at clean JSON
-    else:
-        errors.append("MedGemma: no image was provided")
+                errors.append(f"{step['label']}: invalid answer ({str(e)[:200]})")
+                time.sleep(1)
 
-    # 2. Optional cloud fallback
-    if ALLOW_FALLBACK:
-        for step in LLM_CHAIN:
-            key = os.environ.get(step["key_env"], "")
-            if not key:
-                errors.append(f"{step['label']}: no API key set")
-                continue
-            for attempt in range(2):
-                try:
-                    raw = step["fn"](key, step["model"], SYSTEM_PROMPT, user)
-                    return parse_report(raw), step["label"], errors
-                except LLMError as e:
-                    errors.append(f"{step['label']}: {e}")
-                    if not e.retry:
-                        break
-                    time.sleep(2 * (attempt + 1))
-                except Exception as e:
-                    errors.append(f"{step['label']}: invalid answer ({str(e)[:200]})")
-                    time.sleep(1)
-
-    # 3. Built-in template
+    # Last resort: built-in template (no AI, cannot hallucinate)
     return fallback_report(payload), "Built-in template (AI explanation unavailable)", errors
 
 # =====================================================================
@@ -981,7 +898,7 @@ def show_case(c):
                            mime="application/pdf", key=f"dl_{c['rank']}")
     st.caption(f"Explanation written by: {c['used']}")
     if c["errs"]:
-        with st.expander("Why MedGemma / the AI explanation was not used"):
+        with st.expander("Why the AI explanation was not used"):
             for e in c["errs"]:
                 st.write(e)
 
