@@ -389,14 +389,51 @@ def call_groq(key, model, system, user):
     return call_chat_api(GROQ_URL, key, model, system, user, extra)
 
 
-LLM_CHAIN = [
-    {"label": "Qwen 3.8 27B via OpenRouter (free, validated)", "fn": call_openrouter,
-     "key_env": "OPENROUTER_API_KEY", "model": "qwen/qwen3.8-27b:free", "attempts": 2},
-    {"label": "Gemma 4 31B via OpenRouter (free, validated)", "fn": call_openrouter,
-     "key_env": "OPENROUTER_API_KEY", "model": "google/gemma-4-31b-it:free", "attempts": 2},
-    {"label": "Groq gpt-oss-120b (backup, validated)", "fn": call_groq,
-     "key_env": "GROQ_API_KEY", "model": "openai/gpt-oss-120b", "attempts": 3},
-]
+# Preferred free models, best first. The list of FREE models changes often, so the app asks OpenRouter
+# which ones exist right now and keeps the ones that match these names.
+FREE_MODEL_PREFERENCE = ["gemma-4-31b", "nemotron-3-super", "inkling", "gpt-oss-120b",
+                         "llama-3.3-70b", "qwen3", "gemma-4-26b"]
+FREE_MODEL_SKIP = ("safety", "guard", "code", "coder", "lfm", "liquid", "dolphin", "nano", "lightning",
+                   "stealth", "router", "embed", "audio", "image", "music", "tts")
+FALLBACK_FREE_MODELS = ["google/gemma-4-31b-it:free", "nvidia/nemotron-3-super-120b-a12b:free",
+                        "google/gemma-4-26b-a4b-it:free"]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def openrouter_free_models():
+    """Currently available free text models on OpenRouter (best 3 by preference)."""
+    def rank(mid):
+        low = mid.lower()
+        for i, p in enumerate(FREE_MODEL_PREFERENCE):
+            if p in low:
+                return i
+        return len(FREE_MODEL_PREFERENCE)
+    try:
+        r = requests.get("https://openrouter.ai/api/v1/models", timeout=20)
+        r.raise_for_status()
+        found = []
+        for m in r.json().get("data", []):
+            mid = str(m.get("id", ""))
+            low = mid.lower()
+            if not mid.endswith(":free") or any(w in low for w in FREE_MODEL_SKIP):
+                continue
+            outs = (m.get("architecture") or {}).get("output_modalities") or ["text"]
+            if "text" not in outs or (m.get("context_length") or 0) < 32000:
+                continue
+            found.append(mid)
+        found = [m for m in sorted(found, key=rank) if rank(m) < len(FREE_MODEL_PREFERENCE)]
+        return found[:3] or list(FALLBACK_FREE_MODELS)
+    except Exception:
+        return list(FALLBACK_FREE_MODELS)
+
+
+def build_chain():
+    chain = [{"label": f"{mid} via OpenRouter (free, validated)", "fn": call_openrouter,
+              "key_env": "OPENROUTER_API_KEY", "model": mid, "attempts": 2}
+             for mid in openrouter_free_models()]
+    chain.append({"label": "Groq gpt-oss-120b (backup, validated)", "fn": call_groq,
+                  "key_env": "GROQ_API_KEY", "model": "openai/gpt-oss-120b", "attempts": 3})
+    return chain
 
 
 def parse_report(text):
@@ -424,6 +461,24 @@ def parse_report(text):
 
 def wc(s):
     return len(str(s).split())
+
+
+GLAUCOMA_CLAIM = re.compile(
+    r"\b(patient|you|person|eye)\b[^.!?]{0,30}\b(has|have|had|does not have|do not have|doesn't have|don't have|"
+    r"is diagnosed with|are diagnosed with|diagnosed with)\s+(?:early\s+|advanced\s+|a\s+)?glaucoma\b")
+HEDGE = re.compile(
+    r"\b(not mean|does not mean|doesn't mean|do not mean|not necessarily|cannot|can't|may|might|could|whether|"
+    r"if|unless|not a diagnosis|not diagnos\w*|rule out|confirm\w*)\b")
+
+
+def claims_diagnosis(text):
+    """True only when a sentence ASSERTS that the patient has / does not have glaucoma.
+    Hedged or negated disclaimers such as 'this does not mean you have glaucoma' are allowed."""
+    for sent in re.split(r"(?<=[.!?])\s+|\n+", text):
+        s = sent.lower()
+        if GLAUCOMA_CLAIM.search(s) and not HEDGE.search(s):
+            return True
+    return False
 
 
 def validate_report(rep, payload):
@@ -466,8 +521,9 @@ def validate_report(rep, payload):
     elif v < thr and re.search(r"\b(above|exceeds?)\b[^.]{0,40}threshold", low):
         probs.append(f"Wrong direction: the vCDR {v:.2f} is BELOW the threshold {thr:.2f}.")
 
-    if re.search(r"\b(has|have|diagnosed with|does not have) glaucoma\b", low):
-        probs.append("Never state that the patient has or does not have glaucoma.")
+    if claims_diagnosis(text):
+        probs.append("Never state that the patient has or does not have glaucoma. "
+                     "(Saying that the result does NOT mean the patient has glaucoma is fine.)")
     return probs
 
 
@@ -532,10 +588,13 @@ def generate_report(payload, image_rgb=None):
     user = json.dumps(payload, indent=2)
     errors = []
 
-    for step in LLM_CHAIN:
+    missing = set()
+    for step in build_chain():
         key = get_key(step["key_env"])
         if not key:
-            errors.append(f"{step['label']}: no API key set ({step['key_env']})")
+            if step["key_env"] not in missing:
+                missing.add(step["key_env"])
+                errors.append(f"No API key set ({step['key_env']}), so those models were skipped.")
             continue
         feedback = ""
         for attempt in range(step.get("attempts", LLM_ATTEMPTS)):
