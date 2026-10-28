@@ -1,0 +1,10 @@
+*.h5
+*.weights.h5
+*.keras
+*.pdf
+.env
+*.log
+.ipynb_checkpoints/
+__pycache__/
+data/
+images/
