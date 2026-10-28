@@ -31,7 +31,7 @@ MAX_UPLOAD_MB = 15
 MAX_PHOTOS = 5                    # photographs per batch
 MIN_SIDE_PX = 128
 FRAGMENT_LIMIT = 0.15             # max share of disc pixels allowed outside the largest connected region
-LLM_ATTEMPTS = 3                  # attempts per model, each retry gets the validator's feedback
+LLM_ATTEMPTS = 3                  # default attempts per model, each retry gets the validator's feedback
 DISCLAIMER = ("Research and screening-support prototype. This is NOT a diagnostic tool and must not be used "
               "to make clinical decisions on its own. Every result must be reviewed by a qualified eye-care professional.")
 
@@ -297,7 +297,7 @@ def make_overlay(img, disc, cup):
     return out
 
 # =====================================================================
-# FACTS COMPUTED IN CODE (so the small model never has to do comparisons)
+# FACTS COMPUTED IN CODE (so the model never has to do comparisons)
 # =====================================================================
 def build_facts(met, thr, status, flags):
     v = met["vertical_cdr"]
@@ -319,10 +319,11 @@ def build_facts(met, thr, status, flags):
     }
 
 # =====================================================================
-# LLM CHAIN: Mistral Large (primary) -> Groq gpt-oss-120b (backup) -> built-in template
+# LLM CHAIN: free OpenRouter models (primary) -> Groq gpt-oss-120b (backup) -> built-in template
 # Text-only: the models only receive the measurements computed in code (no image, no name).
+# Free model IDs on OpenRouter change often: if one disappears the next one in the list is used.
 # =====================================================================
-MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 TRANSIENT = (429, 500, 502, 503, 504)
 
@@ -344,18 +345,19 @@ def get_key(name):
         return ""
 
 
-def call_chat_api(url, key, model, system, user, extra=None):
-    """OpenAI-compatible chat completion (works for both Mistral and Groq)."""
+def call_chat_api(url, key, model, system, user, extra=None, json_mode=True):
+    """OpenAI-compatible chat completion (works for OpenRouter and Groq)."""
     body = {
         "model": model,
         "messages": [{"role": "system", "content": system},
                      {"role": "user", "content": user}],
         "temperature": 0.2,
-        "response_format": {"type": "json_object"},
     }
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
     body.update(extra or {})
     try:
-        r = requests.post(url, json=body, timeout=90,
+        r = requests.post(url, json=body, timeout=120,
                           headers={"Authorization": f"Bearer {key}",
                                    "Content-Type": "application/json"})
     except requests.RequestException as e:
@@ -369,11 +371,15 @@ def call_chat_api(url, key, model, system, user, extra=None):
         raise LLMError("unexpected response format", retry=True)
     if isinstance(content, list):                       # some APIs return a list of parts
         content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+    if not content.strip():
+        raise LLMError("empty answer", retry=True)
     return content
 
 
-def call_mistral(key, model, system, user):
-    return call_chat_api(MISTRAL_URL, key, model, system, user, {"max_tokens": 3500})
+def call_openrouter(key, model, system, user):
+    # no response_format: not every free model supports it; parse_report() extracts the JSON anyway
+    return call_chat_api(OPENROUTER_URL, key, model, system, user,
+                         {"max_tokens": 6000, "reasoning": {"effort": "low"}}, json_mode=False)
 
 
 def call_groq(key, model, system, user):
@@ -384,10 +390,12 @@ def call_groq(key, model, system, user):
 
 
 LLM_CHAIN = [
-    {"label": "Mistral Large (primary, validated)", "fn": call_mistral,
-     "key_env": "MISTRAL_API_KEY", "model": "mistral-large-latest"},
+    {"label": "Qwen 3.8 27B via OpenRouter (free, validated)", "fn": call_openrouter,
+     "key_env": "OPENROUTER_API_KEY", "model": "qwen/qwen3.8-27b:free", "attempts": 2},
+    {"label": "Gemma 4 31B via OpenRouter (free, validated)", "fn": call_openrouter,
+     "key_env": "OPENROUTER_API_KEY", "model": "google/gemma-4-31b-it:free", "attempts": 2},
     {"label": "Groq gpt-oss-120b (backup, validated)", "fn": call_groq,
-     "key_env": "GROQ_API_KEY", "model": "openai/gpt-oss-120b"},
+     "key_env": "GROQ_API_KEY", "model": "openai/gpt-oss-120b", "attempts": 3},
 ]
 
 
@@ -530,7 +538,7 @@ def generate_report(payload, image_rgb=None):
             errors.append(f"{step['label']}: no API key set ({step['key_env']})")
             continue
         feedback = ""
-        for attempt in range(LLM_ATTEMPTS):
+        for attempt in range(step.get("attempts", LLM_ATTEMPTS)):
             prompt = ("Write the screening-support report from the JSON below. Do not change, recalculate "
                       "or invent any measurement and do not override the status.\n\nINPUT JSON:\n" + user)
             if feedback:
