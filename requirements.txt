@@ -1,8 +1,8 @@
 streamlit
 tensorflow-cpu
 huggingface_hub
-google-genai
 reportlab
+matplotlib
 opencv-python-headless
 pandas
 numpy
