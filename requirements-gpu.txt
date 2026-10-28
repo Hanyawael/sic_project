@@ -1,5 +1,0 @@
-# Extra packages only needed to run MedGemma locally on a GPU (e.g. Colab)
-torch
-transformers
-accelerate
-pyngrok
