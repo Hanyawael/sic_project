@@ -9,7 +9,7 @@ Deep learning project that segments the **Optic Disc (OD)** and **Optic Cup (OC)
 | Resource | Link |
 |---|---|
 | Streamlit web app | https://glaucoma-segmentation.streamlit.app/ |
-| Trained models (Hugging Face) | https://huggingface.co/hanyawael/glaucoma-segmentation |
+| Trained models (Hugging Face) | https://huggingface.co/hanyawael/glaucoma-segmentation,https://huggingface.co/BESOAE/glaucoma-models/tree/main |
 | dataset | https://www.kaggle.com/datasets/arnavjain1/glaucoma-datasets |
 
 > The `models/` folder in this repository is intentionally empty. The trained weights are hosted on Hugging Face because of their size.
