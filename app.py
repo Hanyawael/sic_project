@@ -319,9 +319,9 @@ def build_facts(met, thr, status, flags):
     }
 
 # =====================================================================
-# LLM CHAIN: free OpenRouter models (primary) -> Groq gpt-oss-120b (backup) -> built-in template
+# LLM CHAIN: Groq gpt-oss-120b (free tier, first) -> free OpenRouter models -> built-in template
 # Text-only: the models only receive the measurements computed in code (no image, no name).
-# Free model IDs on OpenRouter change often: if one disappears the next one in the list is used.
+# Free model IDs on OpenRouter change often: the app checks live that each one is still priced $0.
 # =====================================================================
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -329,9 +329,11 @@ TRANSIENT = (429, 500, 502, 503, 504)
 
 
 class LLMError(Exception):
-    def __init__(self, msg, retry=False):
+    # FIX: carries the HTTP status so the chain can mark dead / rate-limited models
+    def __init__(self, msg, retry=False, status=None):
         super().__init__(msg)
         self.retry = retry
+        self.status = status
 
 
 def get_key(name):
@@ -364,7 +366,9 @@ def call_chat_api(url, key, model, system, user, extra=None, json_mode=True):
         raise LLMError(str(e), retry=True)
     if r.status_code != 200:
         retry = r.status_code in TRANSIENT or "json_validate_failed" in r.text
-        raise LLMError(f"{r.status_code}: {r.text[:200]}", retry=retry)
+        if r.status_code == 429:
+            retry = False          # FIX: do not hammer a rate-limited model; go to the next one
+        raise LLMError(f"{r.status_code}: {r.text[:200]}", retry=retry, status=r.status_code)
     try:
         content = r.json()["choices"][0]["message"].get("content") or ""
     except Exception:
@@ -389,50 +393,54 @@ def call_groq(key, model, system, user):
     return call_chat_api(GROQ_URL, key, model, system, user, extra)
 
 
-# Preferred free models, best first. The list of FREE models changes often, so the app asks OpenRouter
-# which ones exist right now and keeps the ones that match these names.
-FREE_MODEL_PREFERENCE = ["gemma-4-31b", "nemotron-3-super", "inkling", "gpt-oss-120b",
-                         "llama-3.3-70b", "qwen3", "gemma-4-26b"]
-FREE_MODEL_SKIP = ("safety", "guard", "code", "coder", "lfm", "liquid", "dolphin", "nano", "lightning",
-                   "stealth", "router", "embed", "audio", "image", "music", "tts")
-FALLBACK_FREE_MODELS = ["google/gemma-4-31b-it:free", "nvidia/nemotron-3-super-120b-a12b:free",
-                        "google/gemma-4-26b-a4b-it:free"]
+# FIX: explicit model IDs, best first. A model is used only if OpenRouter lists it right now with $0 pricing.
+# (The Thinking Machines "inkling" models are intentionally absent: they return 403 outside agentic harnesses.)
+OPENROUTER_PREFERRED = [
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "google/gemma-4-31b-it:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "openai/gpt-oss-120b:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "google/gemma-4-26b-a4b-it:free",
+]
+FALLBACK_FREE_MODELS = ["nvidia/nemotron-3-ultra-550b-a55b:free", "google/gemma-4-31b-it:free"]
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_resource(show_spinner=False)
+def model_health():
+    """FIX: remembers (while the app runs) which models are unusable or temporarily rate-limited."""
+    return {"dead": set(), "cooldown": {}}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def openrouter_free_models():
-    """Currently available free text models on OpenRouter (best 3 by preference)."""
-    def rank(mid):
-        low = mid.lower()
-        for i, p in enumerate(FREE_MODEL_PREFERENCE):
-            if p in low:
-                return i
-        return len(FREE_MODEL_PREFERENCE)
+    """Preferred models that OpenRouter currently lists with $0 prompt AND completion price (max 4)."""
     try:
         r = requests.get("https://openrouter.ai/api/v1/models", timeout=20)
         r.raise_for_status()
-        found = []
+        live = set()
         for m in r.json().get("data", []):
-            mid = str(m.get("id", ""))
-            low = mid.lower()
-            if not mid.endswith(":free") or any(w in low for w in FREE_MODEL_SKIP):
-                continue
+            pr = m.get("pricing") or {}
+            try:
+                free = float(pr.get("prompt", 1)) == 0 and float(pr.get("completion", 1)) == 0
+            except (TypeError, ValueError):
+                free = False
             outs = (m.get("architecture") or {}).get("output_modalities") or ["text"]
-            if "text" not in outs or (m.get("context_length") or 0) < 32000:
-                continue
-            found.append(mid)
-        found = [m for m in sorted(found, key=rank) if rank(m) < len(FREE_MODEL_PREFERENCE)]
-        return found[:3] or list(FALLBACK_FREE_MODELS)
+            if free and "text" in outs and (m.get("context_length") or 0) >= 32000:
+                live.add(str(m.get("id", "")))
+        chosen = [m for m in OPENROUTER_PREFERRED if m in live]
+        return chosen[:4] or list(FALLBACK_FREE_MODELS)
     except Exception:
         return list(FALLBACK_FREE_MODELS)
 
 
 def build_chain():
-    chain = [{"label": f"{mid} via OpenRouter (free, validated)", "fn": call_openrouter,
-              "key_env": "OPENROUTER_API_KEY", "model": mid, "attempts": 2}
-             for mid in openrouter_free_models()]
-    chain.append({"label": "Groq gpt-oss-120b (backup, validated)", "fn": call_groq,
-                  "key_env": "GROQ_API_KEY", "model": "openai/gpt-oss-120b", "attempts": 3})
+    # FIX: Groq first (more reliable free tier), then the free OpenRouter models
+    chain = [{"label": "Groq gpt-oss-120b (free tier, validated)", "fn": call_groq,
+              "key_env": "GROQ_API_KEY", "model": "openai/gpt-oss-120b", "attempts": 3}]
+    chain += [{"label": f"{mid} via OpenRouter (free, validated)", "fn": call_openrouter,
+               "key_env": "OPENROUTER_API_KEY", "model": mid, "attempts": 2}
+              for mid in openrouter_free_models()]
     return chain
 
 
@@ -587,6 +595,7 @@ def generate_report(payload, image_rgb=None):
     """image_rgb is kept for compatibility but is not sent to any model."""
     user = json.dumps(payload, indent=2)
     errors = []
+    health = model_health()            # FIX
 
     missing = set()
     for step in build_chain():
@@ -595,6 +604,13 @@ def generate_report(payload, image_rgb=None):
             if step["key_env"] not in missing:
                 missing.add(step["key_env"])
                 errors.append(f"No API key set ({step['key_env']}), so those models were skipped.")
+            continue
+        # FIX: skip models already known to be unusable or temporarily rate-limited
+        if step["model"] in health["dead"]:
+            errors.append(f"{step['label']}: skipped (not usable with this key).")
+            continue
+        if health["cooldown"].get(step["model"], 0) > time.time():
+            errors.append(f"{step['label']}: skipped (rate-limited a moment ago).")
             continue
         feedback = ""
         for attempt in range(step.get("attempts", LLM_ATTEMPTS)):
@@ -615,6 +631,10 @@ def generate_report(payload, image_rgb=None):
                 feedback = "- " + "\n- ".join(probs)
             except LLMError as e:
                 errors.append(f"{step['label']}: {e}")
+                if e.status in (401, 403, 404):          # FIX: permanent problem, never try again this session
+                    health["dead"].add(step["model"])
+                elif e.status == 429:                    # FIX: rate-limited, rest this model for 90 s
+                    health["cooldown"][step["model"]] = time.time() + 90
                 if not e.retry:
                     break
                 time.sleep(2 * (attempt + 1))
@@ -1006,6 +1026,8 @@ def analyze_batch(details, thr):
         payload["facts"] = build_facts(c["met"], float(thr), c["status"], c["flags"])
         rep, used, errs = generate_report(payload, c["img"])
         c.update(rep=rep, used=used, errs=list(errs))
+        if k < len(cases) - 1:
+            time.sleep(1)              # FIX: avoid bursts of requests that trigger rate limits
         try:
             c["pdf"] = build_pdf(c["info"], c["img"], c["overlay"], c["met"], c["status"],
                                  c["flags"], rep, used)
